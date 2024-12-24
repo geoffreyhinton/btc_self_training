@@ -2,6 +2,7 @@ package btcwire_test
 
 import (
 	"bytes"
+	"encoding/hex"
 	"github.com/geoffreyhinton/btc_self_training/btcwire"
 	"testing"
 )
@@ -53,5 +54,83 @@ func TestShaHash(t *testing.T) {
 	err = hash.SetBytes([]byte{0x00})
 	if err == nil {
 		t.Errorf("SetBytes: failed to received expected err - got: nil")
+	}
+}
+
+// TestShaHashString  tests the stringized output for sha hashes.
+func TestShaHashString(t *testing.T) {
+	// Block 100000 hash.
+	wantStr := "000000000003ba27aa200b1cecaad478d2b00432346c3f1f3986da1afd33e506"
+	hash := &btcwire.ShaHash{
+		0x06, 0xe5, 0x33, 0xfd, 0x1a, 0xda, 0x86, 0x39,
+		0x1f, 0x3f, 0x6c, 0x34, 0x32, 0x04, 0xb0, 0xd2,
+		0x78, 0xd4, 0xaa, 0xec, 0x1c, 0x0b, 0x20, 0xaa,
+		0x27, 0xba, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}
+	hashStr := hash.String()
+	if hashStr != wantStr {
+		t.Errorf("String: wrong hash string - got %v, want %v",
+			hashStr, wantStr)
+	}
+}
+
+// TestNewShaHashFromStr executes tests against the NewShaHashFromStr function.
+func TestNewShaHashFromStr(t *testing.T) {
+	tests := []struct {
+		in   string
+		want btcwire.ShaHash
+		err  error
+	}{
+		// Single digit hash.
+		{
+			"1",
+			btcwire.ShaHash{
+				0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			},
+			nil,
+		},
+		// Block 203707 with stripped leading zeros.
+		{
+			"3264bc2ac36a60840790ba1d475d01367e7c723da941069e9dc",
+			btcwire.ShaHash{
+				0xdc, 0xe9, 0x69, 0x10, 0x94, 0xda, 0x23, 0xc7,
+				0xe7, 0x67, 0x13, 0xd0, 0x75, 0xd4, 0xa1, 0x0b,
+				0x79, 0x40, 0x08, 0xa6, 0x36, 0xac, 0xc2, 0x4b,
+				0x26, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			},
+			nil,
+		},
+		// Hash string that is too long.
+		{
+			"01234567890123456789012345678901234567890123456789012345678912345",
+			btcwire.ShaHash{},
+			btcwire.ErrHashStrSize,
+		},
+		// Hash string that is contains non-hex chars.
+		{
+			"abcdefg",
+			btcwire.ShaHash{},
+			hex.InvalidByteError('g'),
+		},
+	}
+	unexpectedErrStr := "NewShaHashFromStr #%d failed to detect expected error - got: %v want: %v"
+	unexpectedResultStr := "NewShaHashFromStr #%d got: %v want: %v"
+	t.Logf("Running %d tests", len(tests))
+	for i, test := range tests {
+		result, err := btcwire.NewShaHashFromStr(test.in)
+		if err != test.err {
+			t.Errorf(unexpectedErrStr, i, err, test.err)
+			continue
+		} else if err != nil {
+			// Got expected error. Move on to the next test.
+			continue
+		}
+		if !test.want.IsEqual(result) {
+			t.Errorf(unexpectedResultStr, i, result, &test.want)
+			continue
+		}
 	}
 }
