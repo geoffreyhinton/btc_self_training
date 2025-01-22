@@ -25,3 +25,12 @@ type blockManager struct {
 	wg                sync.WaitGroup
 	quit              chan bool
 }
+
+const (
+	chanBufferSize = 50
+
+	// blockDbNamePrefix is the prefix for the block database name.  The
+	// database type is appended to this value to form the full block
+	// database name.
+	blockDbNamePrefix = "blocks"
+)
