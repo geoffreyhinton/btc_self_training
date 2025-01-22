@@ -73,13 +73,21 @@ func NewNetAddress(addr net.Addr, services ServiceFlag) (*NetAddress, error) {
 	if !ok {
 		return nil, ErrInvalidNetAddr
 	}
+
+	na := NewNetAddressIPPort(tcpAddr.IP, uint16(tcpAddr.Port), services)
+	return na, nil
+}
+
+// NewNetAddressIPPort returns a new NetAddress using the provided IP, port, and
+// supported services with defaults for the remaining fields.
+func NewNetAddressIPPort(ip net.IP, port uint16, services ServiceFlag) *NetAddress {
 	na := NetAddress{
 		Timestamp: time.Now(),
 		Services:  services,
-		IP:        tcpAddr.IP,
-		Port:      uint16(tcpAddr.Port),
+		IP:        ip,
+		Port:      port,
 	}
-	return &na, nil
+	return &na
 }
 
 // readNetAddress reads an encoded NetAddress from r depending on the protocol
