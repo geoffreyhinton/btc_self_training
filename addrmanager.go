@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"container/list"
+	"encoding/binary"
 	"github.com/geoffreyhinton/btc_self_training/btcwire"
+	"net"
 	"sync"
 	"time"
 )
@@ -124,4 +127,208 @@ type serialisedAddrManager struct {
 	Addresses    []*serialisedKnownAddress
 	NewBuckets   [newBucketCount][]string // string is NetAddressKey
 	TriedBuckets [triedBucketCount][]string
+}
+
+func (a *AddrManager) getNewBucket(netAddr, srcAddr *btcwire.NetAddress) int {
+	// bitcoind:
+	// doublesha256(key + sourcegroup + int64(doublesha256(key + group + sourcegroup))%bucket_per_source_group) % num_new_buckes
+
+	data1 := []byte{}
+	data1 = append(data1, a.key[:]...)
+	data1 = append(data1, []byte(GroupKey(netAddr))...)
+	data1 = append(data1, []byte(GroupKey(srcAddr))...)
+	hash1 := btcwire.DoubleSha256(data1)
+	hash64 := binary.LittleEndian.Uint64(hash1)
+	hash64 %= newBucketsPerGroup
+	hashbuf := new(bytes.Buffer)
+	binary.Write(hashbuf, binary.LittleEndian, hash64)
+	data2 := []byte{}
+	data2 = append(data2, a.key[:]...)
+	data2 = append(data2, GroupKey(srcAddr)...)
+	data2 = append(data2, hashbuf.Bytes()...)
+
+	hash2 := btcwire.DoubleSha256(data2)
+	return int(binary.LittleEndian.Uint64(hash2) % newBucketCount)
+}
+
+// RFC1918: IPv4 Private networks (10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12)
+var rfc1918ten = net.IPNet{IP: net.ParseIP("10.0.0.0"),
+	Mask: net.CIDRMask(8, 32)}
+var rfc1918oneninetwo = net.IPNet{IP: net.ParseIP("192.168.0.0"),
+	Mask: net.CIDRMask(16, 32)}
+var rfc1918oneseventwo = net.IPNet{IP: net.ParseIP("172.16.0.0"),
+	Mask: net.CIDRMask(12, 32)}
+
+func RFC1918(na *btcwire.NetAddress) bool {
+	return rfc1918ten.Contains(na.IP) ||
+		rfc1918oneninetwo.Contains(na.IP) ||
+		rfc1918oneseventwo.Contains(na.IP)
+}
+
+// RFC3849 IPv6 Documentation address  (2001:0DB8::/32)
+var rfc3849 = net.IPNet{IP: net.ParseIP("2001:0DB8::"),
+	Mask: net.CIDRMask(32, 128)}
+
+func RFC3849(na *btcwire.NetAddress) bool {
+	return rfc3849.Contains(na.IP)
+}
+
+// RFC3927 IPv4 Autoconfig (169.254.0.0/16)
+var rfc3927 = net.IPNet{IP: net.ParseIP("169.254.0.0"), Mask: net.CIDRMask(16, 32)}
+
+func RFC3927(na *btcwire.NetAddress) bool {
+	return rfc3927.Contains(na.IP)
+}
+
+// RFC3964 IPv6 6to4 (2002::/16)
+var rfc3964 = net.IPNet{IP: net.ParseIP("2002::"),
+	Mask: net.CIDRMask(16, 128)}
+
+func RFC3964(na *btcwire.NetAddress) bool {
+	return rfc3964.Contains(na.IP)
+}
+
+// RFC4193 IPv6 unique local (FC00::/7)
+var rfc4193 = net.IPNet{IP: net.ParseIP("FC00::"),
+	Mask: net.CIDRMask(7, 128)}
+
+func RFC4193(na *btcwire.NetAddress) bool {
+	return rfc4193.Contains(na.IP)
+}
+
+// RFC4380 IPv6 Teredo tunneling (2001::/32)
+var rfc4380 = net.IPNet{IP: net.ParseIP("2001::"),
+	Mask: net.CIDRMask(32, 128)}
+
+func RFC4380(na *btcwire.NetAddress) bool {
+	return rfc4380.Contains(na.IP)
+}
+
+// RFC4843 IPv6 ORCHID: (2001:10::/28)
+var rfc4843 = net.IPNet{IP: net.ParseIP("2001:10::"),
+	Mask: net.CIDRMask(28, 128)}
+
+func RFC4843(na *btcwire.NetAddress) bool {
+	return rfc4843.Contains(na.IP)
+}
+
+// RFC4862 IPv6 Autoconfig (FE80::/64)
+var rfc4862 = net.IPNet{IP: net.ParseIP("FE80::"),
+	Mask: net.CIDRMask(64, 128)}
+
+func RFC4862(na *btcwire.NetAddress) bool {
+	return rfc4862.Contains(na.IP)
+}
+
+// RFC6052: IPv6 well known prefix (64:FF9B::/96)
+var rfc6052 = net.IPNet{IP: net.ParseIP("64:FF9B::"),
+	Mask: net.CIDRMask(96, 128)}
+
+func RFC6052(na *btcwire.NetAddress) bool {
+	return rfc6052.Contains(na.IP)
+}
+
+// RFC6145: IPv6 IPv4 translated address ::FFFF:0:0:0/96
+var rfc6145 = net.IPNet{IP: net.ParseIP("::FFFF:0:0:0"),
+	Mask: net.CIDRMask(96, 128)}
+
+func RFC6145(na *btcwire.NetAddress) bool {
+	return rfc6145.Contains(na.IP)
+}
+
+func Tor(na *btcwire.NetAddress) bool {
+	// bitcoind encodes a .onion address as a 16 byte number by decoding the
+	// address prior to the .onion (i.e. the key hash) base32 into a ten
+	// byte number. it then stores the first 6 bytes of the address as
+	// 0xfD, 0x87, 0xD8, 0x7e, 0xeb, 0x43
+	// making the format
+	// { magic 6 bytes, 10 bytes base32 decode of key hash }
+	// Since we use btcwire.NetAddress to represent and address we may
+	// well have to emulate this.
+	// XXX fillmein
+	return false
+}
+
+var zero4 = net.IPNet{IP: net.ParseIP("0.0.0.0"),
+	Mask: net.CIDRMask(8, 32)}
+
+func Local(na *btcwire.NetAddress) bool {
+	return na.IP.IsLoopback() || zero4.Contains(na.IP)
+}
+
+// Valid returns true if an address is not one of the invalid formats.
+// For IPv4 these are either a 0 or all bits set address. For IPv6 a zero
+// address or one that matches the RFC3849 documentation address format.
+func Valid(na *btcwire.NetAddress) bool {
+	// IsUnspecified returns if address is 0, so only all bits set, and
+	// RFC3849 need to be explicitly checked. bitcoind here also checks for
+	// invalid protocol addresses from earlier versions of bitcoind (before
+	// 0.2.9), however, since protocol versions before 70001 are
+	// disconnected by the bitcoin network now we have elided it.
+	return !(na.IP.IsUnspecified() || RFC3849(na) ||
+		na.IP.Equal(net.IPv4bcast))
+}
+
+// Routable returns whether a netaddress is routable on the public internet or
+// not. This is true as long as the address is valid and is not in any reserved
+// ranges.
+func Routable(na *btcwire.NetAddress) bool {
+	return Valid(na) && !(RFC1918(na) || RFC3927(na) || RFC4862(na) ||
+		RFC4193(na) || Tor(na) || RFC4843(na) || Local(na))
+}
+
+// GroupKey returns a string representing the network group an address
+// is part of.
+// This is the /16 for IPv6, the /32 (/36 for he.net) for IPv6, the string
+// "local" for a local address and the string "unroutable for an unroutable
+// address.
+func GroupKey(na *btcwire.NetAddress) string {
+	if Local(na) {
+		return "local"
+	}
+	if !Routable(na) {
+		return "unroutable"
+	}
+
+	if ipv4 := na.IP.To4(); ipv4 != nil {
+		return (&net.IPNet{IP: na.IP, Mask: net.CIDRMask(16, 32)}).String()
+	}
+	if RFC6145(na) || RFC6052(na) {
+		// last four bytes are the ip address
+		ip := net.IP(na.IP[12:16])
+		return (&net.IPNet{IP: ip, Mask: net.CIDRMask(16, 32)}).String()
+	}
+
+	if RFC3964(na) {
+		ip := net.IP(na.IP[2:7])
+		return (&net.IPNet{IP: ip, Mask: net.CIDRMask(16, 32)}).String()
+
+	}
+	if RFC4380(na) {
+		// teredo tunnels have the last 4 bytes as the v4 address XOR
+		// 0xff.
+		ip := net.IP(make([]byte, 4))
+		for i, byte := range na.IP[12:16] {
+			ip[i] = byte ^ 0xff
+		}
+		return (&net.IPNet{IP: ip, Mask: net.CIDRMask(16, 32)}).String()
+	}
+	// XXX tor?
+	if Tor(na) {
+		panic("oga should have implemented me")
+	}
+
+	// OK, so now we know ourselves to be a IPv6 address.
+	// bitcoind uses /32 for everything but what it calls he.net, which is
+	// it uses /36 for. he.net is actualy 2001:470::/32, whereas bitcoind
+	// counts it as 2011:470::/32.
+
+	bits := 32
+	heNet := &net.IPNet{IP: net.ParseIP("2011:470::"),
+		Mask: net.CIDRMask(32, 128)}
+	if heNet.Contains(na.IP) {
+		bits = 36
+	}
+
+	return (&net.IPNet{IP: na.IP, Mask: net.CIDRMask(bits, 128)}).String()
 }
