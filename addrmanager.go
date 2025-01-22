@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/geoffreyhinton/btc_self_training/btcwire"
+	"math"
 	"math/rand"
 	"net"
 	"os"
@@ -141,6 +142,388 @@ func NetAddressKey(na *btcwire.NetAddress) string {
 	port := strconv.FormatUint(uint64(na.Port), 10)
 	addr := net.JoinHostPort(na.IP.String(), port)
 	return addr
+}
+
+// updateAddress is a helper function to either update an address already known
+// to the address manager, or to add the address if not already known.
+func (a *AddrManager) updateAddress(netAddr, srcAddr *btcwire.NetAddress) {
+	// Filter out non-routable addresses. Note that non-routable
+	// also includes invalid and local addresses.
+	if !Routable(netAddr) {
+		return
+	}
+
+	// Protect concurrent access.
+	a.mtx.Lock()
+	defer a.mtx.Unlock()
+
+	addr := NetAddressKey(netAddr)
+	ka := a.find(netAddr)
+	if ka != nil {
+		// TODO(oga) only update adresses periodically.
+		// Update the last seen time.
+		if netAddr.Timestamp.After(ka.na.Timestamp) {
+			ka.na.Timestamp = netAddr.Timestamp
+		}
+
+		// Update services.
+		ka.na.AddService(netAddr.Services)
+
+		// If already in tried, we have nothing to do here.
+		if ka.tried {
+			return
+		}
+
+		// Already at our max?
+		if ka.refs == newBucketsPerAddress {
+			return
+		}
+
+		// The more entries we have, the less likely we are to add more.
+		// likelyhood is 2N.
+		factor := int32(2 * ka.refs)
+		if a.rand.Int31n(factor) != 0 {
+			return
+		}
+	} else {
+		ka = &knownAddress{na: netAddr, srcAddr: srcAddr}
+		a.addrIndex[addr] = ka
+		a.nNew++
+		// XXX time penalty?
+	}
+
+	bucket := a.getNewBucket(netAddr, srcAddr)
+
+	// Already exists?
+	if _, ok := a.addrNew[bucket][addr]; ok {
+		return
+	}
+
+	// Enforce max addresses.
+	if len(a.addrNew[bucket]) > newBucketSize {
+		log.Tracef("[AMGR] new bucket is full, expiring old ")
+		a.expireNew(bucket)
+	}
+
+	// Add to new bucket.
+	ka.refs++
+	a.addrNew[bucket][addr] = ka
+
+	log.Tracef("[AMGR] Added new address %s for a total of %d addresses",
+		addr, a.nTried+a.nNew)
+}
+
+func (a *AddrManager) find(addr *btcwire.NetAddress) *knownAddress {
+	return a.addrIndex[NetAddressKey(addr)]
+}
+
+// NeedMoreAddresses returns whether or not the address manager needs more
+// addresses.
+func (a *AddrManager) NeedMoreAddresses() bool {
+	// NumAddresses handles concurrent access for us.
+
+	return a.NumAddresses() < needAddressThreshold
+}
+
+// NumAddresses returns the number of addresses known to the address manager.
+func (a *AddrManager) NumAddresses() int {
+	a.mtx.Lock()
+	defer a.mtx.Unlock()
+
+	return a.nTried + a.nNew
+}
+
+// chance returns the selection probability for a known address.  The priority
+// depends upon how recent the address has been seen, how recent it was last
+// attempted and how often attempts to connect to it have failed.
+func chance(ka *knownAddress) float64 {
+	c := 1.0
+
+	now := time.Now()
+	var lastSeen float64
+	var lastTry float64
+	if !ka.na.Timestamp.After(now) {
+		var dur time.Duration
+		if ka.na.Timestamp.IsZero() {
+			// use unix epoch to match bitcoind.
+			dur = now.Sub(time.Unix(0, 0))
+
+		} else {
+			dur = now.Sub(ka.na.Timestamp)
+		}
+		lastSeen = dur.Seconds()
+	}
+	if !ka.lastattempt.After(now) {
+		var dur time.Duration
+		if ka.lastattempt.IsZero() {
+			// use unix epoch to match bitcoind.
+			dur = now.Sub(time.Unix(0, 0))
+		} else {
+			dur = now.Sub(ka.lastattempt)
+		}
+		lastTry = dur.Seconds()
+	}
+
+	c = 600.0 / (600.0 + lastSeen)
+
+	// Very recent attempts are less likely to be retried.
+	if lastTry > 60.0*10.0 {
+		c *= 0.01
+	}
+
+	// Failed attempts deprioritise.
+	if ka.attempts > 0 {
+		c /= float64(ka.attempts) * 1.5
+	}
+
+	return c
+}
+
+// GetAddress returns a single address that should be routable.  It picks a
+// random one from the possible addresses with preference given to ones that
+// have not been used recently and should not pick 'close' addresses
+// consecutively.
+func (a *AddrManager) GetAddress(class string, newBias int) *knownAddress {
+	if a.NumAddresses() == 0 {
+		return nil
+	}
+
+	// Protect concurrent access.
+	a.mtx.Lock()
+	defer a.mtx.Unlock()
+
+	if newBias > 100 {
+		newBias = 100
+	}
+	if newBias < 0 {
+		newBias = 0
+	}
+
+	// Bias between new and tried addresses.
+	triedCorrelation := math.Sqrt(float64(a.nTried)) *
+		(100.0 - float64(newBias))
+	newCorrelation := math.Sqrt(float64(a.nNew)) * float64(newBias)
+
+	if (newCorrelation+triedCorrelation)*a.rand.Float64() <
+		triedCorrelation {
+		// Tried entry.
+		large := 1 << 30
+		factor := 1.0
+		for {
+			// pick a random bucket.
+			bucket := a.rand.Intn(len(a.addrTried))
+			if a.addrTried[bucket].Len() == 0 {
+				continue
+			}
+
+			// Pick a random entry in the list
+			e := a.addrTried[bucket].Front()
+			for i :=
+				a.rand.Int63n(int64(a.addrTried[bucket].Len())); i > 0; i-- {
+				e = e.Next()
+			}
+			ka := e.Value.(*knownAddress)
+			randval := a.rand.Intn(large)
+			if float64(randval) < (factor * chance(ka) * float64(large)) {
+				log.Tracef("[AMGR] Selected %v from tried "+
+					"bucket", NetAddressKey(ka.na))
+				return ka
+			}
+			factor *= 1.2
+		}
+	} else {
+		// new node.
+		// XXX use a closure/function to avoid repeating this.
+		large := 1 << 30
+		factor := 1.0
+		for {
+			// Pick a random bucket.
+			bucket := a.rand.Intn(len(a.addrNew))
+			if len(a.addrNew[bucket]) == 0 {
+				continue
+			}
+			// Then, a random entry in it.
+			var ka *knownAddress
+			nth := a.rand.Intn(len(a.addrNew[bucket]))
+			for _, value := range a.addrNew[bucket] {
+				if nth == 0 {
+					ka = value
+				}
+				nth--
+			}
+			randval := a.rand.Intn(large)
+			if float64(randval) < (factor * chance(ka) * float64(large)) {
+				log.Tracef("[AMGR] Selected %v from new bucket",
+					NetAddressKey(ka.na))
+				return ka
+			}
+			factor *= 1.2
+		}
+	}
+}
+
+/*
+ * Connected - updates the last seen time but only every 20 minutes.
+ * Good - last tried = last success = last seen = now. attmempts = 0.
+ *      - move address to tried.
+ * Attempted - set last tried to time. nattempts++
+ */
+func (a *AddrManager) Attempt(addr *btcwire.NetAddress) {
+	a.mtx.Lock()
+	defer a.mtx.Unlock()
+
+	// find address.
+	// Surely address will be in tried by now?
+	ka := a.find(addr)
+	if ka == nil {
+		return
+	}
+	// set last tried time to now
+	ka.attempts++
+	ka.lastattempt = time.Now()
+}
+
+// Connected Marks the given address as currently connected and working at the
+// current time.  The address must already be known to AddrManager else it will
+// be ignored.
+func (a *AddrManager) Connected(addr *btcwire.NetAddress) {
+	a.mtx.Lock()
+	defer a.mtx.Unlock()
+
+	ka := a.find(addr)
+	if ka == nil {
+		return
+	}
+
+	// Update the time as long as it has been 20 minutes since last we did
+	// so.
+	now := time.Now()
+	if now.After(ka.na.Timestamp.Add(time.Minute * 20)) {
+		ka.na.Timestamp = time.Now()
+	}
+}
+func (a *AddrManager) getTriedBucket(netAddr *btcwire.NetAddress) int {
+	// bitcoind hashes this as:
+	// doublesha256(key + group + truncate_to_64bits(doublesha256(key)) % buckets_per_group) % num_buckets
+	data1 := []byte{}
+	data1 = append(data1, a.key[:]...)
+	data1 = append(data1, []byte(NetAddressKey(netAddr))...)
+	hash1 := btcwire.DoubleSha256(data1)
+	hash64 := binary.LittleEndian.Uint64(hash1)
+	hash64 %= triedBucketsPerGroup
+	hashbuf := new(bytes.Buffer)
+	binary.Write(hashbuf, binary.LittleEndian, hash64)
+	data2 := []byte{}
+	data2 = append(data2, a.key[:]...)
+	data2 = append(data2, GroupKey(netAddr)...)
+	data2 = append(data2, hashbuf.Bytes()...)
+
+	hash2 := btcwire.DoubleSha256(data2)
+	return int(binary.LittleEndian.Uint64(hash2) % triedBucketCount)
+}
+
+// pickTried selects an address from the tried bucket to be evicted.
+// We just choose the eldest. Bitcoind selects 4 random entries and throws away
+// the older of them.
+func (a *AddrManager) pickTried(bucket int) *list.Element {
+	var oldest *knownAddress
+	var oldestElem *list.Element
+	for e := a.addrTried[bucket].Front(); e != nil; e = e.Next() {
+		ka := e.Value.(*knownAddress)
+		if oldest == nil || oldest.na.Timestamp.After(ka.na.Timestamp) {
+			oldestElem = e
+			oldest = ka
+		}
+
+	}
+	return oldestElem
+}
+
+// Good marks the given address as good.  To be called after a successful
+// connection and version exchange.  If the address is unknown to the addresss
+// manager it will be ignored.
+func (a *AddrManager) Good(addr *btcwire.NetAddress) {
+	a.mtx.Lock()
+	defer a.mtx.Unlock()
+
+	ka := a.find(addr)
+	if ka == nil {
+		return
+	}
+	now := time.Now()
+	ka.lastsuccess = now
+	ka.lastattempt = now
+	ka.na.Timestamp = now
+	ka.attempts = 0
+
+	// move to tried set, optionally evicting other addresses if neeed.
+	if ka.tried {
+		return
+	}
+
+	// ok, need to move it to tried.
+
+	// remove from all new buckets.
+	// record one of the buckets in question and call it the `first'
+	addrKey := NetAddressKey(addr)
+	oldBucket := -1
+	for i := range a.addrNew {
+		// we check for existance so we can record the first one
+		if _, ok := a.addrNew[i][addrKey]; ok {
+			delete(a.addrNew[i], addrKey)
+			ka.refs--
+			if oldBucket == -1 {
+				oldBucket = i
+			}
+		}
+	}
+	a.nNew--
+
+	if oldBucket == -1 {
+		// What? wasn't in a bucket after all.... Panic?
+		return
+	}
+
+	bucket := a.getTriedBucket(ka.na)
+
+	// Room in this tried bucket?
+	if a.addrTried[bucket].Len() < triedBucketSize {
+		ka.tried = true
+		a.addrTried[bucket].PushBack(ka)
+		a.nTried++
+		return
+	}
+
+	// No room, we have to evict something else.
+	entry := a.pickTried(bucket)
+	rmka := entry.Value.(*knownAddress)
+
+	// First bucket it would have been put in.
+	newBucket := a.getNewBucket(rmka.na, rmka.srcAddr)
+
+	// If no room in the original bucket, we put it in a bucket we just
+	// freed up a space in.
+	if len(a.addrNew[newBucket]) >= newBucketSize {
+		newBucket = oldBucket
+	}
+
+	// replace with ka in list.
+	ka.tried = true
+	entry.Value = ka
+
+	rmka.tried = false
+	rmka.refs++
+
+	// We don't touch a.nTried here since the number of tried stays the same
+	// but we decemented new above, raise it again since we're putting
+	// something back.
+	a.nNew++
+
+	rmkey := NetAddressKey(rmka.na)
+	log.Tracef("[AMGR] replacing %s with %s in tried", rmkey, addrKey)
+
+	// We made sure there is space here just above.
+	a.addrNew[newBucket][rmkey] = rmka
 }
 
 // bad returns true if the address in question has not been tried in the last
