@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"github.com/geoffreyhinton/btc_self_training/btcwire"
 	"net"
 	"os"
@@ -275,6 +276,110 @@ func (a *AddrManager) savePeers() {
 	defer w.Close()
 	enc.Encode(&sam)
 }
+
+func deserialiseNetAddress(addr string) (*btcwire.NetAddress, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ip := net.ParseIP(host)
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return nil, err
+	}
+	na := btcwire.NewNetAddressIPPort(ip, uint16(port),
+		btcwire.SFNodeNetwork)
+	return na, nil
+}
+
+func (a *AddrManager) deserialisePeers(filePath string) error {
+
+	_, err := os.Stat(filePath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	r, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("%s error opening file: %v", filePath, err)
+	}
+	defer r.Close()
+
+	var sam serialisedAddrManager
+	dec := json.NewDecoder(r)
+	err = dec.Decode(&sam)
+	if err != nil {
+		return fmt.Errorf("error reading %s: %v", filePath, err)
+	}
+
+	if sam.Version != serialisationVersion {
+		return fmt.Errorf("unknown version %v in serialised "+
+			"addrmanager", sam.Version)
+	}
+	copy(a.key[:], sam.Key[:])
+
+	for _, v := range sam.Addresses {
+		ka := new(knownAddress)
+		ka.na, err = deserialiseNetAddress(v.Addr)
+		if err != nil {
+			return fmt.Errorf("failed to deserialise netaddress "+
+				"%s: %v", v.Addr, err)
+		}
+		ka.srcAddr, err = deserialiseNetAddress(v.Src)
+		if err != nil {
+			return fmt.Errorf("failed to deserialise netaddress "+
+				"%s: %v", v.Src, err)
+		}
+		ka.attempts = v.Attempts
+		ka.lastattempt = time.Unix(v.LastAttempt, 0)
+		ka.lastsuccess = time.Unix(v.LastSuccess, 0)
+		a.addrIndex[NetAddressKey(ka.na)] = ka
+	}
+
+	for i := range sam.NewBuckets {
+		for _, val := range sam.NewBuckets[i] {
+			ka, ok := a.addrIndex[val]
+			if !ok {
+				return fmt.Errorf("newbucket contains %s but "+
+					"none in address list", val)
+			}
+
+			if ka.refs == 0 {
+				a.nNew++
+			}
+			ka.refs++
+			a.addrNew[i][val] = ka
+		}
+	}
+	for i := range sam.TriedBuckets {
+		for _, val := range sam.TriedBuckets[i] {
+			ka, ok := a.addrIndex[val]
+			if !ok {
+				return fmt.Errorf("Newbucket contains %s but "+
+					"none in address list", val)
+			}
+
+			ka.tried = true
+			a.nTried++
+			a.addrTried[i].PushBack(ka)
+		}
+	}
+
+	// Sanity checking.
+	for k, v := range a.addrIndex {
+		if v.refs == 0 && !v.tried {
+			return fmt.Errorf("address %s after serialisation "+
+				"with no references", k)
+		}
+
+		if v.refs > 0 && v.tried {
+			return fmt.Errorf("address %s after serialisation "+
+				"which is both new and tried!", k)
+		}
+	}
+
+	return nil
+}
+
 func (a *AddrManager) getNewBucket(netAddr, srcAddr *btcwire.NetAddress) int {
 	// bitcoind:
 	// doublesha256(key + sourcegroup + int64(doublesha256(key + group + sourcegroup))%bucket_per_source_group) % num_new_buckes
