@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"container/list"
 	"encoding/binary"
+	"encoding/json"
 	"github.com/geoffreyhinton/btc_self_training/btcwire"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -215,6 +218,63 @@ func (a *AddrManager) expireNew(bucket int) {
 	}
 }
 
+// savePeers saves all the known addresses to a file so they can be read back
+// in at next run.
+func (a *AddrManager) savePeers() {
+	a.mtx.Lock()
+	defer a.mtx.Unlock()
+	// First we make a serialisable datastructure so we can encode it to
+	// json.
+
+	sam := new(serialisedAddrManager)
+	sam.Version = serialisationVersion
+	copy(sam.Key[:], a.key[:])
+
+	sam.Addresses = make([]*serialisedKnownAddress, len(a.addrIndex))
+	i := 0
+	for k, v := range a.addrIndex {
+		ska := new(serialisedKnownAddress)
+		ska.Addr = k
+		ska.TimeStamp = v.na.Timestamp.Unix()
+		ska.Src = NetAddressKey(v.srcAddr)
+		ska.Attempts = v.attempts
+		ska.LastAttempt = v.lastattempt.Unix()
+		ska.LastSuccess = v.lastsuccess.Unix()
+		// Tried and refs are implicit in the rest of the structure
+		// and will be worked out from context on unserialisation.
+		sam.Addresses[i] = ska
+		i++
+	}
+	for i := range a.addrNew {
+		sam.NewBuckets[i] = make([]string, len(a.addrNew[i]))
+		j := 0
+		for k := range a.addrNew[i] {
+			sam.NewBuckets[i][j] = k
+			j++
+		}
+	}
+	for i := range a.addrTried {
+		sam.TriedBuckets[i] = make([]string, a.addrTried[i].Len())
+		j := 0
+		for e := a.addrTried[i].Front(); e != nil; e = e.Next() {
+			ka := e.Value.(*knownAddress)
+			sam.TriedBuckets[i][j] = NetAddressKey(ka.na)
+			j++
+		}
+	}
+
+	// May give some way to specify this later.
+	filename := "peers.json"
+	filePath := filepath.Join(cfg.DataDir, filename)
+
+	w, err := os.Create(filePath)
+	if err != nil {
+		log.Error("Error opening file: ", filePath, err)
+	}
+	enc := json.NewEncoder(w)
+	defer w.Close()
+	enc.Encode(&sam)
+}
 func (a *AddrManager) getNewBucket(netAddr, srcAddr *btcwire.NetAddress) int {
 	// bitcoind:
 	// doublesha256(key + sourcegroup + int64(doublesha256(key + group + sourcegroup))%bucket_per_source_group) % num_new_buckes
