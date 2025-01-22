@@ -2,7 +2,9 @@ package main
 
 import (
 	"container/list"
+	"github.com/geoffreyhinton/btc_self_training/btcwire"
 	"sync"
+	"time"
 )
 
 // AddrManager provides a concurrency safe address manager for caching potential
@@ -20,4 +22,16 @@ type AddrManager struct {
 	quit      chan bool
 	nTried    int
 	nNew      int
+}
+
+// knownAddress tracks information about a known network address that is used
+// to determine how viable an address is.
+type knownAddress struct {
+	na          *btcwire.NetAddress
+	srcAddr     *btcwire.NetAddress
+	attempts    int
+	lastattempt time.Time
+	lastsuccess time.Time
+	tried       bool
+	refs        int // reference count of new buckets
 }
