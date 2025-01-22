@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"github.com/geoffreyhinton/btc_self_training/btcwire"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -127,6 +128,91 @@ type serialisedAddrManager struct {
 	Addresses    []*serialisedKnownAddress
 	NewBuckets   [newBucketCount][]string // string is NetAddressKey
 	TriedBuckets [triedBucketCount][]string
+}
+
+// NetAddressKey returns a string key in the form of ip:port for IPv4 addresses
+// or [ip]:port for IPv6 addresses.
+func NetAddressKey(na *btcwire.NetAddress) string {
+	port := strconv.FormatUint(uint64(na.Port), 10)
+	addr := net.JoinHostPort(na.IP.String(), port)
+	return addr
+}
+
+// bad returns true if the address in question has not been tried in the last
+// minute and meets one of the following criteria:
+// 1) It claims to be from the future
+// 2) It hasn't been seen in over a month
+// 3) It has failed at least three times and never succeeded
+// 4) It has failed ten times in the last week
+// All addresses that meet these criteria are assumed to be worthless and not
+// worth keeping hold of.
+func bad(ka *knownAddress) bool {
+	if ka.lastattempt.After(time.Now().Add(-1 * time.Minute)) {
+		return false
+	}
+
+	// From the future?
+	if ka.na.Timestamp.After(time.Now().Add(10 * time.Minute)) {
+		return true
+	}
+
+	// Over a month old?
+	if ka.na.Timestamp.After(time.Now().Add(-1 * numMissingDays * time.Hour * 24)) {
+		return true
+	}
+
+	// Never succeeded?
+	if ka.lastsuccess.IsZero() && ka.attempts >= numRetries {
+		return true
+	}
+
+	// Hasn't succeeded in too long?
+	if !ka.lastsuccess.After(time.Now().Add(-1*minBadDays*time.Hour*24)) &&
+		ka.attempts >= maxFailures {
+		return true
+	}
+
+	return false
+}
+
+// expireNew makes space in the new buckets by expiring the really bad entries.
+// If no bad entries are available we look at a few and remove the oldest.
+func (a *AddrManager) expireNew(bucket int) {
+	// First see if there are any entries that are so bad we can just throw
+	// them away. otherwise we throw away the oldest entry in the cache.
+	// Bitcoind here chooses four random and just throws the oldest of
+	// those away, but we keep track of oldest in the initial traversal and
+	// use that information instead.
+	var oldest *knownAddress
+	for k, v := range a.addrNew[bucket] {
+		if bad(v) {
+			log.Tracef("[AMGR] expiring bad address %v", k)
+			delete(a.addrNew[bucket], k)
+			a.nNew--
+			v.refs--
+			if v.refs == 0 {
+				delete(a.addrIndex, k)
+			}
+			return
+		}
+		if oldest == nil {
+			oldest = v
+		} else if !v.na.Timestamp.After(oldest.na.Timestamp) {
+			oldest = v
+		}
+	}
+
+	if oldest != nil {
+		key := NetAddressKey(oldest.na)
+		log.Tracef("[AMGR] expiring oldest address %v", key)
+
+		delete(a.addrNew[bucket], key)
+		a.nNew--
+		oldest.refs--
+		if oldest.refs == 0 {
+			delete(a.addrIndex, key)
+		}
+	}
 }
 
 func (a *AddrManager) getNewBucket(netAddr, srcAddr *btcwire.NetAddress) int {
