@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/geoffreyhinton/btc_self_training/btcwire"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
