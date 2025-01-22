@@ -35,3 +35,13 @@ type knownAddress struct {
 	tried       bool
 	refs        int // reference count of new buckets
 }
+
+type serialisedKnownAddress struct {
+	Addr        string
+	Src         string
+	Attempts    int
+	TimeStamp   int64
+	LastAttempt int64
+	LastSuccess int64
+	// no refcount or tried, that is available from context.
+}
